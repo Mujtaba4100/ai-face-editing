@@ -10,35 +10,20 @@ import numpy as np
 from typing import Tuple, Optional
 import logging
 import os
-import dlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize dlib face detector and landmark predictor
-detector = dlib.get_frontal_face_detector()
-predictor = None
-
-# Try to load predictor from common locations
-predictor_path = '/tmp/shape_predictor_68_face_landmarks.dat'
-if os.path.exists(predictor_path):
-    predictor = dlib.shape_predictor(predictor_path)
-else:
-    # Download predictor if not available
-    import urllib.request
-    import bz2
-    try:
-        url = 'http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2'
-        logger.info("Downloading dlib face landmarks model...")
-        urllib.request.urlretrieve(url, '/tmp/model.dat.bz2')
-        with bz2.BZ2File('/tmp/model.dat.bz2', 'rb') as f:
-            with open(predictor_path, 'wb') as out:
-                out.write(f.read())
-        predictor = dlib.shape_predictor(predictor_path)
-        logger.info("✓ Model downloaded successfully")
-    except Exception as e:
-        logger.warning(f"Could not download dlib model: {e}")
+# Initialize insightface face detector and landmark predictor
+try:
+    import insightface
+    app = insightface.app.FaceAnalysis(providers=['CPUProvider'])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    logger.info("✓ InsightFace loaded successfully")
+except Exception as e:
+    logger.warning(f"InsightFace initialization failed: {e}")
+    app = None
 
 
 # ============================================================================
@@ -80,52 +65,46 @@ def get_landmark_indices():
 
 def detect_face_landmarks(image: np.ndarray) -> Optional[np.ndarray]:
     """
-    Detect facial landmarks using dlib (68 points).
-    Maps to 468-point format for compatibility.
+    Detect facial landmarks using InsightFace (106 points).
     
     Args:
         image: Input image (BGR)
     
     Returns:
-        Landmarks array or None if no face detected
+        Landmarks array (468 for compatibility) or None if no face detected
     """
     try:
-        # dlib detection
-        dets = detector(image, 1)
+        if app is None:
+            logger.error("InsightFace not initialized")
+            return None
         
-        if len(dets) == 0:
-            logger.warning("No face detected using dlib")
+        # InsightFace works with RGB
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Detect faces
+        faces = app.get(rgb_image)
+        
+        if len(faces) == 0:
+            logger.warning("No face detected using InsightFace")
             return None
         
         # Get first face
-        face = dets[0]
+        face = faces[0]
         
-        # Get 68 landmarks
-        if predictor is not None:
-            landmarks_dlib = predictor(image, face)
-            landmarks_array = np.array([[p.x, p.y] for p in landmarks_dlib.parts()], dtype=np.float32)
-            
-            # Expand 68 landmarks to 468-point format for compatibility
-            landmarks_468 = np.zeros((468, 2), dtype=np.float32)
-            
-            # Map dlib 68 landmarks to MediaPipe-compatible indices
-            # Dlib 68: 0-16 (jaw), 17-26 (left brow), 26-35 (right brow),
-            #          36-47 (eyes), 48-67 (mouth)
-            
-            # Copy directly mapped points
-            landmarks_468[:68] = landmarks_array
-            
-            # Fill remaining 400 points with interpolated positions
-            face_center = np.mean(landmarks_array, axis=0)
-            for i in range(68, 468):
-                # Interpolate based on existing landmarks
-                idx = i % 68
-                landmarks_468[i] = landmarks_array[idx]
-            
-            return landmarks_468
-        else:
-            return None
-            
+        # Get 106 landmarks
+        landmarks_106 = face.landmark_2d_106  # Shape: (106, 2)
+        
+        # Expand to 468-point format for compatibility
+        landmarks_468 = np.zeros((468, 2), dtype=np.float32)
+        landmarks_468[:106] = landmarks_106.astype(np.float32)
+        
+        # Fill remaining points by interpolation
+        for i in range(106, 468):
+            idx = i % 106
+            landmarks_468[i] = landmarks_106[idx]
+        
+        return landmarks_468
+        
     except Exception as e:
         logger.error(f"Landmark detection error: {e}")
         return None
@@ -151,15 +130,16 @@ def get_region_points(landmarks: np.ndarray, indices: list) -> np.ndarray:
 
 def enlarge_lips(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Enlarge lips using actual dlib landmarks (48-68).
+    Enlarge lips using InsightFace landmarks (55-87 = mouth).
     """
     if scale == 1.0:
         return image
     
     result = image.copy().astype(np.float32)
     
-    # Dlib lips: 48-68 (outer contour)
-    lip_outer = landmarks[48:60].astype(np.int32)
+    # InsightFace mouth: 55-87 (33 points around mouth)
+    # Use outer mouth contour (roughly 55-70)
+    lip_outer = landmarks[55:71].astype(np.int32)
     
     if len(lip_outer) < 2:
         return image
@@ -178,13 +158,16 @@ def enlarge_lips(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.n
 
 def adjust_nose_width(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Adjust nose width using dlib landmarks (27-35).
+    Adjust nose width using InsightFace landmarks (51-54 = nose).
     """
     if scale == 1.0:
         return image
     
     result = image.copy().astype(np.float32)
-    nose_points = landmarks[27:36].astype(np.int32)
+    
+    # InsightFace nose: 51-54 (4 points)
+    # Expand to get more coverage
+    nose_points = landmarks[51:56].astype(np.int32)
     
     if len(nose_points) < 2:
         return image
@@ -203,7 +186,7 @@ def adjust_nose_width(image: np.ndarray, landmarks: np.ndarray, scale: float) ->
 
 def raise_eyebrows(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Raise eyebrows using dlib landmarks (17-26).
+    Raise eyebrows using InsightFace landmarks (33-42 = eyebrows).
     """
     if scale == 1.0:
         return image
@@ -211,8 +194,8 @@ def raise_eyebrows(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np
     result = image.copy().astype(np.float32)
     h, w = image.shape[:2]
     
-    # Dlib eyebrows: 17-26 (left 17-21, right 22-26)
-    eyebrow_points = np.vstack([landmarks[17:22], landmarks[22:27]]).astype(np.int32)
+    # InsightFace eyebrows: 33-37 (left), 38-42 (right)
+    eyebrow_points = np.vstack([landmarks[33:38], landmarks[38:43]]).astype(np.int32)
     
     if len(eyebrow_points) < 2:
         return image
