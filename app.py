@@ -18,11 +18,15 @@ logger = logging.getLogger(__name__)
 # Initialize insightface face detector and landmark predictor
 try:
     import insightface
-    app = insightface.app.FaceAnalysis(providers=['CPUProvider'])
-    app.prepare(ctx_id=0, det_size=(640, 640))
-    logger.info("✓ InsightFace loaded successfully")
+    app = insightface.app.FaceAnalysis(name='buffalo_l', providers=['CPUProvider'])
+    app.prepare(ctx_id=-1, det_size=(640, 640))
+    logger.info("✓ InsightFace loaded successfully with buffalo_l model")
+except ImportError:
+    logger.error("InsightFace not installed. Install: pip install insightface onnxruntime")
+    app = None
 except Exception as e:
-    logger.warning(f"InsightFace initialization failed: {e}")
+    logger.error(f"InsightFace initialization failed: {e}")
+    logger.error("Make sure onnxruntime is installed: pip install onnxruntime")
     app = None
 
 
@@ -347,7 +351,7 @@ def edit_face(
 def create_interface():
     """Create and return the Gradio interface."""
     
-    with gr.Blocks(title="AI Facial Editor", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="AI Facial Editor") as demo:
         gr.Markdown("""
         # 🎨 AI Facial Editor
         Upload a photo, adjust features, and download your edit.
@@ -467,4 +471,4 @@ def create_interface():
 
 if __name__ == "__main__":
     demo = create_interface()
-    demo.launch(share=False)
+    demo.launch(share=False, theme=gr.themes.Soft())
