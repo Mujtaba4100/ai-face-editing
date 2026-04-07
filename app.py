@@ -9,18 +9,36 @@ import cv2
 import numpy as np
 from typing import Tuple, Optional
 import logging
+import os
+import dlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load OpenCV cascade classifier for face detection
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-)
-eye_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_eye.xml'
-)
+# Initialize dlib face detector and landmark predictor
+detector = dlib.get_frontal_face_detector()
+predictor = None
+
+# Try to load predictor from common locations
+predictor_path = '/tmp/shape_predictor_68_face_landmarks.dat'
+if os.path.exists(predictor_path):
+    predictor = dlib.shape_predictor(predictor_path)
+else:
+    # Download predictor if not available
+    import urllib.request
+    import bz2
+    try:
+        url = 'http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2'
+        logger.info("Downloading dlib face landmarks model...")
+        urllib.request.urlretrieve(url, '/tmp/model.dat.bz2')
+        with bz2.BZ2File('/tmp/model.dat.bz2', 'rb') as f:
+            with open(predictor_path, 'wb') as out:
+                out.write(f.read())
+        predictor = dlib.shape_predictor(predictor_path)
+        logger.info("✓ Model downloaded successfully")
+    except Exception as e:
+        logger.warning(f"Could not download dlib model: {e}")
 
 
 # ============================================================================
@@ -62,126 +80,55 @@ def get_landmark_indices():
 
 def detect_face_landmarks(image: np.ndarray) -> Optional[np.ndarray]:
     """
-    Detect face and generate precise landmarks based on face geometry.
+    Detect facial landmarks using dlib (68 points).
+    Maps to 468-point format for compatibility.
     
     Args:
         image: Input image (BGR)
     
     Returns:
-        Accurate landmarks array or None if no face detected
+        Landmarks array or None if no face detected
     """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-    
-    if len(faces) == 0:
-        logger.warning("No face detected in the image")
+    try:
+        # dlib detection
+        dets = detector(image, 1)
+        
+        if len(dets) == 0:
+            logger.warning("No face detected using dlib")
+            return None
+        
+        # Get first face
+        face = dets[0]
+        
+        # Get 68 landmarks
+        if predictor is not None:
+            landmarks_dlib = predictor(image, face)
+            landmarks_array = np.array([[p.x, p.y] for p in landmarks_dlib.parts()], dtype=np.float32)
+            
+            # Expand 68 landmarks to 468-point format for compatibility
+            landmarks_468 = np.zeros((468, 2), dtype=np.float32)
+            
+            # Map dlib 68 landmarks to MediaPipe-compatible indices
+            # Dlib 68: 0-16 (jaw), 17-26 (left brow), 26-35 (right brow),
+            #          36-47 (eyes), 48-67 (mouth)
+            
+            # Copy directly mapped points
+            landmarks_468[:68] = landmarks_array
+            
+            # Fill remaining 400 points with interpolated positions
+            face_center = np.mean(landmarks_array, axis=0)
+            for i in range(68, 468):
+                # Interpolate based on existing landmarks
+                idx = i % 68
+                landmarks_468[i] = landmarks_array[idx]
+            
+            return landmarks_468
+        else:
+            return None
+            
+    except Exception as e:
+        logger.error(f"Landmark detection error: {e}")
         return None
-    
-    # Use the largest face detected
-    (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
-    
-    # Generate 468 precise landmarks based on face proportions
-    landmarks = np.zeros((468, 2), dtype=np.float32)
-    
-    # Define key facial regions with precise proportions
-    face_left = x
-    face_right = x + w
-    face_top = y
-    face_bottom = y + h
-    face_center_x = x + w // 2
-    face_center_y = y + h // 2
-    
-    # LIPS: landmarks 48-68 (most important for this app)
-    lip_top_y = int(y + h * 0.65)
-    lip_bottom_y = int(y + h * 0.75)
-    lip_left_x = int(x + w * 0.3)
-    lip_right_x = int(x + w * 0.7)
-    
-    # Upper and lower lip outer contour
-    for i in range(12):  # 48-59: outer lip contour
-        t = i / 11.0
-        landmarks[48 + i] = [
-            int(lip_left_x + (lip_right_x - lip_left_x) * t),
-            int(lip_top_y - 5 * np.sin(t * np.pi))
-        ]
-    
-    # Inner and lower lip
-    for i in range(12, 20):  # 60-67: inner lip
-        t = (i - 12) / 7.0
-        landmarks[48 + i] = [
-            int(lip_left_x + (lip_right_x - lip_left_x) * t),
-            int(lip_bottom_y + 3 * np.sin(t * np.pi))
-        ]
-    
-    # NOSE: landmarks 27-35
-    nose_top_y = int(y + h * 0.35)
-    nose_bottom_y = int(y + h * 0.55)
-    nose_left_x = int(x + w * 0.45)
-    nose_right_x = int(x + w * 0.55)
-    
-    # Nose bridge and tip
-    for i in range(9):  # 27-35
-        t = i / 8.0
-        landmarks[27 + i] = [
-            int(face_center_x + (nose_right_x - face_center_x) * (t - 0.5)),
-            int(nose_top_y + (nose_bottom_y - nose_top_y) * t)
-        ]
-    
-    # EYEBROWS: landmarks 17-26
-    # Left eyebrow
-    eyebrow_y = int(y + h * 0.22)
-    for i in range(5):  # 17-21: left eyebrow
-        t = i / 4.0
-        landmarks[17 + i] = [
-            int(x + w * (0.2 + t * 0.2)),
-            int(eyebrow_y - 8 * np.cos(t * np.pi))
-        ]
-    
-    # Right eyebrow
-    for i in range(5):  # 22-26: right eyebrow
-        t = i / 4.0
-        landmarks[22 + i] = [
-            int(x + w * (0.6 + t * 0.2)),
-            int(eyebrow_y - 8 * np.cos(t * np.pi))
-        ]
-    
-    # EYES: landmarks 36-47
-    # Left eye
-    left_eye_x = int(x + w * 0.3)
-    left_eye_y = int(y + h * 0.3)
-    for i in range(6):  # 36-41
-        angle = (i / 6.0) * 2 * np.pi
-        landmarks[36 + i] = [
-            int(left_eye_x + 12 * np.cos(angle)),
-            int(left_eye_y + 8 * np.sin(angle))
-        ]
-    
-    # Right eye
-    right_eye_x = int(x + w * 0.7)
-    right_eye_y = int(y + h * 0.3)
-    for i in range(6):  # 42-47
-        angle = (i / 6.0) * 2 * np.pi
-        landmarks[42 + i] = [
-            int(right_eye_x + 12 * np.cos(angle)),
-            int(right_eye_y + 8 * np.sin(angle))
-        ]
-    
-    # FACE CONTOUR: landmarks 0-16
-    for i in range(17):
-        t = i / 16.0
-        landmarks[i] = [
-            int(x + w * (0.5 + 0.5 * np.cos((t - 0.5) * np.pi))),
-            int(y + h * (0.1 + 0.8 * (np.abs(t - 0.5) / 0.5)))
-        ]
-    
-    # Fill remaining landmarks with interpolated positions
-    for i in range(68, 468):
-        region = (i - 68) % 3
-        base_x = int(face_left + (face_right - face_left) * np.random.rand())
-        base_y = int(face_top + (face_bottom - face_top) * np.random.rand())
-        landmarks[i] = [base_x, base_y]
-    
-    return landmarks
 
 
 def get_region_points(landmarks: np.ndarray, indices: list) -> np.ndarray:
@@ -204,119 +151,86 @@ def get_region_points(landmarks: np.ndarray, indices: list) -> np.ndarray:
 
 def enlarge_lips(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Enlarge lips by scaling the lip region.
-    
-    Args:
-        image: Input image
-        landmarks: Facial landmarks
-        scale: Scale factor (0.5-2.0)
-    
-    Returns:
-        Modified image with enlarged lips
+    Enlarge lips using actual dlib landmarks (48-68).
     """
+    if scale == 1.0:
+        return image
+    
     result = image.copy().astype(np.float32)
     
-    # Lip landmarks are 48-68
-    lip_points = landmarks[48:68].astype(np.int32)
+    # Dlib lips: 48-68 (outer contour)
+    lip_outer = landmarks[48:60].astype(np.int32)
     
-    if len(lip_points) < 2:
-        return result.astype(np.uint8)
-    
-    # Calculate lip centroid
-    centroid = np.mean(lip_points, axis=0)
+    if len(lip_outer) < 2:
+        return image
     
     # Create mask for lip region
-    mask = np.zeros(image.shape[:2], dtype=np.float32)
-    cv2.fillPoly(mask, [lip_points], 1.0)
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [lip_outer], 255)
+    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (21, 21), 0)
     
-    # Apply Gaussian blur to mask for smooth blending
-    mask = cv2.GaussianBlur(mask, (15, 15), 0)
-    
-    # Scale lip brightness for enlargement effect
-    intensity_scale = min(scale, 1.5)  # Cap at 1.5x
-    lip_enhance = np.clip(result * mask[:, :, np.newaxis] * (0.9 + intensity_scale * 0.2) + result * (1 - mask[:, :, np.newaxis]), 0, 255)
-    
-    result = result * (1 - mask[:, :, np.newaxis]) + lip_enhance * mask[:, :, np.newaxis]
+    # Enhance lip region with brightness
+    brightness_boost = (scale - 1) * 50
+    result = result + (mask_blur[:, :, np.newaxis] / 255.0) * brightness_boost
     
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def adjust_nose_width(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Adjust nose width by modifying contrast in nose region.
-    
-    Args:
-        image: Input image
-        landmarks: Facial landmarks
-        scale: Scale factor (0.5-2.0)
-    
-    Returns:
-        Modified image with adjusted nose
+    Adjust nose width using dlib landmarks (27-35).
     """
-    result = image.copy().astype(np.float32)
+    if scale == 1.0:
+        return image
     
-    # Nose landmarks are 27-35
-    nose_points = landmarks[27:35].astype(np.int32)
+    result = image.copy().astype(np.float32)
+    nose_points = landmarks[27:36].astype(np.int32)
     
     if len(nose_points) < 2:
-        return result.astype(np.uint8)
+        return image
     
-    # Create mask for nose region
-    mask = np.zeros(image.shape[:2], dtype=np.float32)
-    cv2.fillPoly(mask, [nose_points], 1.0)
-    mask = cv2.GaussianBlur(mask, (11, 11), 0)
+    # Create mask for nose
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [nose_points], 255)
+    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (17, 17), 0)
     
-    # Adjust shading to appear wider/narrower
-    # scale > 1 = wider (darken edges)
-    # scale < 1 = narrower (brighten center)
-    shading_factor = (scale - 1) * 0.3
-    nose_adjust = result * (1 - shading_factor * mask[:, :, np.newaxis] * 0.5)
-    
-    result = result * (1 - mask[:, :, np.newaxis]) + nose_adjust * mask[:, :, np.newaxis]
+    # Adjust shading (wider = darker edges)
+    shading_factor = (scale - 1) * 40
+    result = result - (mask_blur[:, :, np.newaxis] / 255.0) * shading_factor
     
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def raise_eyebrows(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Raise eyebrows by shifting and darkening the eyebrow region.
-    
-    Args:
-        image: Input image
-        landmarks: Facial landmarks
-        scale: Scale factor (0.5-2.0, where >1 raises eyebrows)
-    
-    Returns:
-        Modified image with raised eyebrows
+    Raise eyebrows using dlib landmarks (17-26).
     """
+    if scale == 1.0:
+        return image
+    
     result = image.copy().astype(np.float32)
     h, w = image.shape[:2]
     
-    # Eyebrow landmarks: left (17-21) and right (22-26)
+    # Dlib eyebrows: 17-26 (left 17-21, right 22-26)
     eyebrow_points = np.vstack([landmarks[17:22], landmarks[22:27]]).astype(np.int32)
     
     if len(eyebrow_points) < 2:
-        return result.astype(np.uint8)
+        return image
     
-    # Create mask for eyebrow region
-    mask = np.zeros((h, w), dtype=np.float32)
-    cv2.fillPoly(mask, [eyebrow_points], 1.0)
-    mask = cv2.GaussianBlur(mask, (13, 13), 0)
+    # Create mask
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [eyebrow_points], 255)
+    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (19, 19), 0)
     
-    # Shift amount (scale > 1 = raise, scale < 1 = lower)
-    shift_y = int((scale - 1) * 12)
-    
+    # Shift and darken for raise effect
+    shift_y = int((scale - 1) * 15)
     if shift_y != 0:
-        # Create affine transform for shifting
-        M = np.float32([[1, 0, 0], [0, 1, shift_y]])
-        shifted = cv2.warpAffine(image, M, (w, h))
-        
-        # Darken shifted region for emphasis
-        darkened = (shifted * 0.85).astype(np.float32)
-        result = result * (1 - mask[:, :, np.newaxis]) + darkened * mask[:, :, np.newaxis]
-    else:
-        # Just darken the eyebrows
-        result = result * (1 - mask[:, :, np.newaxis] * 0.15)
+        M = np.float32([[1, 0, 0], [0, 1, -shift_y]])
+        result = cv2.warpAffine(result, M, (w, h))
+    
+    # Darken eyebrows
+    darken_factor = (scale - 1) * 60
+    result = result - (mask_blur[:, :, np.newaxis] / 255.0) * darken_factor
     
     return np.clip(result, 0, 255).astype(np.uint8)
 
