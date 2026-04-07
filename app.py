@@ -134,90 +134,159 @@ def get_region_points(landmarks: np.ndarray, indices: list) -> np.ndarray:
 
 def enlarge_lips(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Enlarge lips using InsightFace landmarks (55-87 = mouth).
+    Enlarge/reduce lips naturally using warping based on landmarks.
     """
     if scale == 1.0:
         return image
     
+    h, w = image.shape[:2]
     result = image.copy().astype(np.float32)
     
-    # InsightFace mouth: 55-87 (33 points around mouth)
-    # Use outer mouth contour (roughly 55-70)
-    lip_outer = landmarks[55:71].astype(np.int32)
+    # InsightFace mouth region: 55-87 (outer + inner contours)
+    mouth_outer = landmarks[55:71].astype(np.float32)  # Outer mouth
+    mouth_inner = landmarks[71:87].astype(np.float32)  # Inner mouth
     
-    if len(lip_outer) < 2:
+    if len(mouth_outer) < 4:
         return image
     
-    # Create mask for lip region
-    mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [lip_outer], 255)
-    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (21, 21), 0)
+    # Calculate mouth center
+    mouth_center = np.mean(mouth_outer, axis=0)
     
-    # Enhance lip region with brightness
-    brightness_boost = (scale - 1) * 50
-    result = result + (mask_blur[:, :, np.newaxis] / 255.0) * brightness_boost
+    # Create refined mask for lip region with soft edges
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [mouth_outer.astype(np.int32)], 255)
+    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (15, 15), 0) / 255.0
+    
+    # Scale lips outward from center (natural enlargement)
+    scale_amount = (scale - 1) * 0.3  # Moderate scaling
+    
+    for y in range(h):
+        for x in range(w):
+            if mask_blur[y, x] > 0.01:
+                # Vector from center to current pixel
+                dx = x - mouth_center[0]
+                dy = y - mouth_center[1]
+                
+                # Apply radial scaling
+                new_x = int(mouth_center[0] + dx * (1 + scale_amount * mask_blur[y, x]))
+                new_y = int(mouth_center[1] + dy * (1 + scale_amount * mask_blur[y, x]))
+                
+                # Clamp and sample
+                if 0 <= new_x < w and 0 <= new_y < h:
+                    result[y, x] = image[new_y, new_x].astype(np.float32) * 0.7 + result[y, x] * 0.3
+    
+    # Subtle color enhancement: slightly increase saturation in lips (not white)
+    h_hsv = cv2.cvtColor(result.astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+    h_hsv[:, :, 1] = np.clip(h_hsv[:, :, 1] * (1 + mask_blur * (scale - 1) * 0.15), 0, 255)  # Subtle saturation boost
+    result = cv2.cvtColor(h_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
     
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def adjust_nose_width(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Adjust nose width using InsightFace landmarks (51-54 = nose).
+    Adjust nose width naturally using geometric transformation.
     """
     if scale == 1.0:
         return image
     
+    h, w = image.shape[:2]
     result = image.copy().astype(np.float32)
     
-    # InsightFace nose: 51-54 (4 points)
-    # Expand to get more coverage
-    nose_points = landmarks[51:56].astype(np.int32)
+    # InsightFace nose: 51-56 (6 points: tip, bridge, left/right sides, nostril region)
+    nose_points = landmarks[51:57].astype(np.float32)
     
-    if len(nose_points) < 2:
+    if len(nose_points) < 4:
         return image
     
-    # Create mask for nose
-    mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [nose_points], 255)
-    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (17, 17), 0)
+    # Calculate nose center (tip)
+    nose_center = nose_points[0]  # Tip of nose
     
-    # Adjust shading (wider = darker edges)
-    shading_factor = (scale - 1) * 40
-    result = result - (mask_blur[:, :, np.newaxis] / 255.0) * shading_factor
+    # Create a refined mask for nose region
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [nose_points.astype(np.int32)], 255)
+    # Expand mask for more natural coverage
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (13, 13), 0) / 255.0
+    
+    # Horizontal compression/expansion for width adjustment
+    # scale > 1: widen nose, scale < 1: narrow nose
+    width_factor = 1.0 + (scale - 1.0) * 0.2  # Conservative scaling
+    
+    map_x = np.zeros((h, w), dtype=np.float32)
+    map_y = np.zeros((h, w), dtype=np.float32)
+    
+    for y in range(h):
+        for x in range(w):
+            # Distance from nose center horizontally
+            dx = x - nose_center[0]
+            
+            # Apply width adjustment with smooth blending
+            blend = mask_blur[y, x]
+            new_x = nose_center[0] + dx / (1 + blend * (width_factor - 1.0))
+            
+            map_x[y, x] = new_x
+            map_y[y, x] = y
+    
+    # Apply geometric transformation
+    warped = cv2.remap(image.astype(np.uint8), map_x, map_y, cv2.INTER_LINEAR)
+    
+    # Blend original with warped based on mask
+    result = image.astype(np.float32) * (1 - mask_blur[:, :, np.newaxis]) + \
+             warped.astype(np.float32) * mask_blur[:, :, np.newaxis]
     
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def raise_eyebrows(image: np.ndarray, landmarks: np.ndarray, scale: float) -> np.ndarray:
     """
-    Raise eyebrows using InsightFace landmarks (33-42 = eyebrows).
+    Raise eyebrows naturally using smooth warping.
     """
     if scale == 1.0:
         return image
     
-    result = image.copy().astype(np.float32)
     h, w = image.shape[:2]
+    result = image.copy().astype(np.float32)
     
-    # InsightFace eyebrows: 33-37 (left), 38-42 (right)
-    eyebrow_points = np.vstack([landmarks[33:38], landmarks[38:43]]).astype(np.int32)
+    # InsightFace eyebrows: 33-42 (left and right eyebrows)
+    left_eyebrow = landmarks[33:38].astype(np.float32)   # Left eyebrow (5 points)
+    right_eyebrow = landmarks[38:43].astype(np.float32)  # Right eyebrow (5 points)
     
-    if len(eyebrow_points) < 2:
+    eyebrow_points = np.vstack([left_eyebrow, right_eyebrow])
+    
+    if len(eyebrow_points) < 4:
         return image
     
-    # Create mask
+    # Create a clean, tight mask just for eyebrows
     mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(mask, [eyebrow_points], 255)
-    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (19, 19), 0)
+    cv2.fillPoly(mask, [eyebrow_points.astype(np.int32)], 255)
+    mask_blur = cv2.GaussianBlur(mask.astype(np.float32), (11, 11), 0) / 255.0
     
-    # Shift and darken for raise effect
-    shift_y = int((scale - 1) * 15)
-    if shift_y != 0:
-        M = np.float32([[1, 0, 0], [0, 1, -shift_y]])
-        result = cv2.warpAffine(result, M, (w, h))
+    # Calculate vertical shift (raise eyebrows upward)
+    shift_amount = int((scale - 1) * 12)  # Conservative upward movement
     
-    # Darken eyebrows
-    darken_factor = (scale - 1) * 60
-    result = result - (mask_blur[:, :, np.newaxis] / 255.0) * darken_factor
+    map_x = np.zeros((h, w), dtype=np.float32)
+    map_y = np.zeros((h, w), dtype=np.float32)
+    
+    for y in range(h):
+        for x in range(w):
+            blend = mask_blur[y, x]
+            # Apply upward shift with smooth blending
+            map_y[y, x] = y + shift_amount * blend
+            map_x[y, x] = x
+    
+    # Warp image to raise eyebrows
+    warped = cv2.remap(image.astype(np.uint8), map_x, map_y, cv2.INTER_LINEAR)
+    
+    # Blend with original
+    result = image.astype(np.float32) * (1 - mask_blur[:, :, np.newaxis]) + \
+             warped.astype(np.float32) * mask_blur[:, :, np.newaxis]
+    
+    # Subtle darkening to emphasize eyebrows (not harsh)
+    hsv = cv2.cvtColor(result.astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1 - mask_blur * (scale - 1.0) * 0.1), 0, 255)  # Subtle darkening
+    result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
     
     return np.clip(result, 0, 255).astype(np.uint8)
 
@@ -357,13 +426,23 @@ def create_interface():
         Upload a photo, adjust features, and download your edit.
         """)
         
-        # ===== UPLOAD SECTION =====
-        gr.Markdown("## 📸 Step 1: Upload Your Photo")
-        input_image = gr.Image(
-            label="Upload Face Image",
-            type="numpy",
-            sources=["upload", "webcam"]
-        )
+        # ===== IMAGES SIDE BY SIDE =====
+        gr.Markdown("## 📸 Before & After")
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### Original")
+                input_image = gr.Image(
+                    label="Upload Face Image",
+                    type="numpy",
+                    sources=["upload", "webcam"]
+                )
+            
+            with gr.Column():
+                gr.Markdown("### Edited")
+                output_image = gr.Image(
+                    label="Your Edited Photo",
+                    type="numpy"
+                )
         
         # ===== CONTROLS SECTION =====
         gr.Markdown("## 🎛️ Step 2: Adjust Features")
@@ -407,15 +486,6 @@ def create_interface():
                 maximum=10,
                 value=0,
                 step=1
-            )
-        
-        # ===== OUTPUT & ACTION =====
-        gr.Markdown("## 📤 Step 3: Preview & Download")
-        
-        with gr.Group():
-            output_image = gr.Image(
-                label="Your Edited Photo",
-                type="numpy"
             )
         
         status_text = gr.Textbox(
