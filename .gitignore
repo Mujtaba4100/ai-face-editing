@@ -1,1 +1,11 @@
 venv/
+app_final_masked.py
+app_final_production.py
+app_grok.py
+app_grok_v2.py
+app_grok_v3.py
+app_claude.py
+
+.venv/
+__pycache__/
+*.md
