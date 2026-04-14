@@ -1,6 +1,9 @@
-"""PROFESSIONAL AI FACIAL EDITOR - v10
-FINAL FIX: Extremely tight localized warps for forehead and eyebrows
-No more bleed into eyes / alien stretch
+"""PROFESSIONAL AI FACIAL EDITOR - v11
+FIXES:
+- Forehead mask now extends above jaw to cover actual forehead
+- Forehead warp uses face WIDTH as reference (jaw top was below brow_y)
+- Stronger, correctly scaled dy magnitude
+- No more bleed into eyes/eyebrows
 """
 
 import gradio as gr
@@ -73,7 +76,6 @@ def _gauss_push(mx, my, cx, cy, dx, dy, sigma):
 
 
 def combined_warp(img, all_pts, all_disps, all_sigmas):
-    """Warp with per-feature sigma control."""
     if len(all_pts) == 0:
         return img
     h, w = img.shape[:2]
@@ -83,17 +85,8 @@ def combined_warp(img, all_pts, all_disps, all_sigmas):
     return cv2.remap(img, mx, my, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT_101)
 
 
-def create_face_mask(lm, h, w):
-    jaw = lm[0:33, :2].astype(np.int32)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, jaw, 255)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-    mask = cv2.dilate(mask, kernel, iterations=2)
-    mask = cv2.GaussianBlur(mask, (31, 31), 0)
-    return mask.astype(np.float32) / 255.0
-
-
 # ====================== DISPLACEMENTS ======================
+
 def get_lips_disps(lm, intensity):
     if abs(intensity - 1.0) < 0.005:
         return np.empty((0, 2)), np.empty((0, 2)), 5.5
@@ -131,7 +124,7 @@ def get_eyebrows_disps(lm, intensity):
     brow_pts = np.vstack([left_brow, right_brow]).astype(np.float32)
     eye_y = np.mean([lm[35:42, 1].mean(), lm[87:94, 1].mean()])
     dist = max(abs(brow_pts[:, 1].mean() - eye_y), 18.0)
-    mag = -(intensity - 1.0) * dist * 0.65
+    mag = -(intensity - 1.0) * dist * 1.15
     disps = np.zeros_like(brow_pts)
     disps[:, 1] = mag
     return brow_pts, disps, 3.8
@@ -149,7 +142,7 @@ def get_face_slim_disps(lm, intensity):
     right = side_pts[side_pts[:, 0] > g['cx']]
     if len(left) < 3 or len(right) < 3:
         return np.empty((0, 2)), np.empty((0, 2)), 5.0
-    push = (intensity - 1.0) * g['w'] * 0.045
+    push = (intensity - 1.0) * g['w'] * 0.025
     pts = np.vstack([left, right])
     disps = np.vstack([
         np.column_stack([np.full(len(left), push), np.zeros(len(left))]),
@@ -174,22 +167,63 @@ def get_jaw_disps(lm, intensity):
 
 
 def get_forehead_disps(lm, intensity):
-    """v10: highest possible hairline + tightest sigma for clean isolation."""
     if abs(intensity - 1.0) < 0.005:
         return np.empty((0, 2)), np.empty((0, 2)), 5.0
+
     g = face_geo(lm)
     brow_y = np.mean([lm[43:52, 1].mean(), lm[97:106, 1].mean()])
-    hairline_y = g['top'] + (brow_y - g['top']) * 0.65
-    fh_h = max(brow_y - hairline_y, 20.0)
-    xs = np.linspace(g['left'] + g['w'] * 0.05, g['right'] - g['w'] * 0.05, 12)
-    pts = np.column_stack([xs, np.full(12, hairline_y)]).astype(np.float32)
-    dy = -(intensity - 1.0) * fh_h * 0.82
+
+    # Mid-forehead = halfway between brows and estimated hairline
+    # Estimated hairline = brow_y minus 40% of face width
+    estimated_hairline_y = brow_y - g['w'] * 0.40
+    mid_forehead_y = (brow_y + estimated_hairline_y) / 2.0
+
+    # sigma must be tight: half the distance from mid-forehead to brows
+    half_dist_to_brow = (brow_y - mid_forehead_y) / 2.0
+    sigma = max(half_dist_to_brow * 0.7, 8.0)
+
+    # dy: intensity>1 pushes mid-forehead UP (opens forehead)
+    #     intensity<1 pushes mid-forehead DOWN (shrinks forehead)
+    dy = -(intensity - 1.0) * (brow_y - mid_forehead_y) * 0.6
+
+    xs = np.linspace(g['left'] + g['w'] * 0.10, g['right'] - g['w'] * 0.10, 10)
+    pts = np.column_stack([xs, np.full(10, mid_forehead_y)]).astype(np.float32)
     disps = np.zeros_like(pts)
     disps[:, 1] = dy
-    return pts, disps, 5.0
+
+    return pts, disps, sigma
 
 
+def create_face_mask(lm, h, w):
+    jaw = lm[0:33, :2].astype(np.int32)
+    face_w = int(jaw[:, 0].max() - jaw[:, 0].min())
+    cx = int(jaw[:, 0].mean())
+
+    brow_y = int(np.mean([lm[43:52, 1].mean(), lm[97:106, 1].mean()]))
+
+    # Mask top = estimated hairline (40% of face_w above brows)
+    forehead_top = max(0, brow_y - int(face_w * 0.40))
+
+    forehead_pts = np.array([
+        [jaw[:, 0].min() + int(face_w * 0.10), brow_y],
+        [cx - int(face_w * 0.20), forehead_top],
+        [cx,                       forehead_top],
+        [cx + int(face_w * 0.20), forehead_top],
+        [jaw[:, 0].max() - int(face_w * 0.10), brow_y],
+    ], dtype=np.int32)
+
+    full_poly = np.vstack([jaw, forehead_pts])
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, cv2.convexHull(full_poly), 255)
+
+    # Minimal dilation — just enough to blend edges, not pull in hair
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.GaussianBlur(mask, (15, 15), 0)
+    return mask.astype(np.float32) / 255.0
 # ====================== POST-PROCESS ======================
+
 def smooth_skin(img, strength):
     if strength < 0.01:
         return img
@@ -236,6 +270,7 @@ def apply_filter(bgr, name):
 
 
 # ====================== PIPELINE ======================
+
 def edit_face(img_rgb, lips=1.0, nose=1.0, eyebrows=1.0, face_slim=1.0,
               jaw=1.0, forehead=1.0, brightness=1.0, smoothing=0.0, filter_name="original"):
     if img_rgb is None:
@@ -278,6 +313,7 @@ def edit_face(img_rgb, lips=1.0, nose=1.0, eyebrows=1.0, face_slim=1.0,
         else:
             warped = orig_bgr.copy()
 
+        # v11: mask now covers forehead correctly
         mask = create_face_mask(lm, h, w)
         mask3 = np.stack([mask] * 3, axis=2)
         result_bgr = (warped * mask3 + orig_bgr * (1 - mask3)).astype(np.uint8)
@@ -297,8 +333,8 @@ def edit_face(img_rgb, lips=1.0, nose=1.0, eyebrows=1.0, face_slim=1.0,
 
 
 def create_ui():
-    with gr.Blocks(title="AI Facial Editor v10") as demo:
-        gr.Markdown("# AI Facial Editor v10\n✅ Forehead and eyebrow bleed fixed\n✅ Clean, natural movement")
+    with gr.Blocks(title="AI Facial Editor v11") as demo:
+        gr.Markdown("# AI Facial Editor v11\n✅ Forehead warp fully fixed\n✅ Mask now covers forehead\n✅ No eye/brow bleed")
 
         with gr.Row():
             with gr.Column():
@@ -312,13 +348,13 @@ def create_ui():
 
         gr.Markdown("### Face Shape")
         with gr.Group():
-            sl_slim = gr.Slider(label="Face Slim / Widen", minimum=0.6, maximum=1.45, value=1.0, step=0.02)
+            sl_slim = gr.Slider(label="Face Slim / Widen", minimum=0.85, maximum=1.2, value=1.0, step=0.02)
             sl_jaw = gr.Slider(label="Jaw / Chin Length", minimum=0.6, maximum=1.45, value=1.0, step=0.02)
             sl_fore = gr.Slider(label="Forehead Height", minimum=0.6, maximum=1.45, value=1.0, step=0.02)
 
         gr.Markdown("### Features")
         with gr.Group():
-            sl_lips = gr.Slider(label="Lips Fullness", minimum=0.6, maximum=1.9, value=1.0, step=0.05)
+            sl_lips = gr.Slider(label="Lips Fullness", minimum=0.6, maximum=1.55, value=1.0, step=0.05)
             sl_nose = gr.Slider(label="Nose Width", minimum=0.6, maximum=1.8, value=1.0, step=0.05)
             sl_brows = gr.Slider(label="Eyebrow Height", minimum=0.6, maximum=1.8, value=1.0, step=0.05)
 
@@ -326,7 +362,9 @@ def create_ui():
         with gr.Group():
             sl_bright = gr.Slider(label="Brightness", minimum=0.7, maximum=1.8, value=1.0, step=0.05)
             sl_smooth = gr.Slider(label="Skin Smoothing", minimum=0.0, maximum=1.0, value=0.0, step=0.05)
-            dd_filter = gr.Dropdown(label="Filter", choices=["original", "cinematic", "glamour", "vivid", "cool", "warm", "noir"], value="original")
+            dd_filter = gr.Dropdown(label="Filter",
+                                    choices=["original", "cinematic", "glamour", "vivid", "cool", "warm", "noir"],
+                                    value="original")
 
         controls = [inp, sl_lips, sl_nose, sl_brows, sl_slim, sl_jaw, sl_fore, sl_bright, sl_smooth, dd_filter]
 
@@ -352,7 +390,9 @@ def create_ui():
         def reset():
             return 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, "original", "Reset"
 
-        reset_btn.click(reset, outputs=[sl_lips, sl_nose, sl_brows, sl_slim, sl_jaw, sl_fore, sl_bright, sl_smooth, dd_filter, stat])
+        reset_btn.click(reset,
+                        outputs=[sl_lips, sl_nose, sl_brows, sl_slim, sl_jaw,
+                                 sl_fore, sl_bright, sl_smooth, dd_filter, stat])
 
     return demo
 
